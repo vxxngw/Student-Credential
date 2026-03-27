@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    Address, Env, String, Symbol,
+    Address, Env, String, Vec,
     symbol_short, log,
 };
 
@@ -9,34 +9,52 @@ use soroban_sdk::{
 // DATA TYPES
 // ============================================================
 
-/// Loại credential
+/// Trạng thái của một payment request
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub enum CredentialType {
-    Certificate,   // Chứng chỉ hoàn thành khóa học
-    Degree,        // Bằng tốt nghiệp
-    Achievement,   // Thành tích đặc biệt
+pub enum RequestStatus {
+    Pending,    // Chờ thanh toán
+    Paid,       // Đã thanh toán
+    Cancelled,  // Đã huỷ
 }
 
-/// Trạng thái credential
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum CredentialStatus {
-    Active,   // Đang có hiệu lực
-    Revoked,  // Đã bị thu hồi
-}
-
-/// Thông tin một credential
+/// Một payment request (yêu cầu thanh toán)
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct Credential {
+pub struct PaymentRequest {
     pub id: u64,
-    pub student: Address,
-    pub course_name: String,
-    pub credential_type: CredentialType,
-    pub status: CredentialStatus,
-    pub issued_at: u64,     // timestamp (ledger sequence)
-    pub points: u32,        // điểm thưởng đi kèm khi cấp
+    pub from: Address,      // người yêu cầu (merchant / bạn bè)
+    pub to: Address,        // người cần trả
+    pub amount: i128,       // số XLM (tính bằng stroops: 1 XLM = 10_000_000 stroops)
+    pub note: String,       // mô tả (ví dụ: "Tiền cơm trưa")
+    pub status: RequestStatus,
+    pub created_at: u64,
+}
+
+/// Một giao dịch đã hoàn thành
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Transaction {
+    pub id: u64,
+    pub sender: Address,
+    pub receiver: Address,
+    pub amount: i128,
+    pub note: String,
+    pub timestamp: u64,
+}
+
+/// Một bill cần chia
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SplitBill {
+    pub id: u64,
+    pub creator: Address,           // người tạo bill
+    pub total_amount: i128,         // tổng tiền
+    pub note: String,               // mô tả (ví dụ: "Ăn tối sinh nhật")
+    pub participants: Vec<Address>, // danh sách người tham gia
+    pub amount_per_person: i128,    // tiền mỗi người phải trả
+    pub paid_count: u32,            // số người đã trả
+    pub created_at: u64,
 }
 
 // ============================================================
@@ -45,11 +63,20 @@ pub struct Credential {
 
 #[contracttype]
 pub enum DataKey {
-    Admin,                      // địa chỉ admin
-    CredentialCount,            // tổng số credential đã cấp
-    Credential(u64),            // credential theo ID
-    StudentPoints(Address),     // tổng điểm của sinh viên
-    StudentCredCount(Address),  // số credential của sinh viên
+    // Counters
+    TxCount,
+    RequestCount,
+    SplitCount,
+
+    // Records
+    Transaction(u64),
+    Request(u64),
+    Split(u64),
+
+    // Per-user tracking
+    UserTxCount(Address),     // số giao dịch của user
+    UserLastTx(Address),      // ID giao dịch gần nhất
+    SplitPaid(u64, Address),  // đã thanh toán split bill chưa
 }
 
 // ============================================================
@@ -57,195 +84,358 @@ pub enum DataKey {
 // ============================================================
 
 #[contract]
-pub struct StudentCredentialContract;
+pub struct LocalPaymentContract;
 
 #[contractimpl]
-impl StudentCredentialContract {
+impl LocalPaymentContract {
 
     // ----------------------------------------------------------
-    // INIT — gọi 1 lần duy nhất khi deploy
+    // SEND PAYMENT — chuyển tiền trực tiếp
     // ----------------------------------------------------------
 
-    /// Khởi tạo contract, set admin
-    pub fn initialize(env: Env, admin: Address) {
-        // Kiểm tra chưa initialize
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("Already initialized");
-        }
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::CredentialCount, &0u64);
-
-        log!(&env, "Contract initialized. Admin: {}", admin);
-    }
-
-    // ----------------------------------------------------------
-    // ISSUE — cấp credential cho sinh viên
-    // ----------------------------------------------------------
-
-    /// Admin cấp credential cho sinh viên
-    /// Trả về ID của credential vừa tạo
-    pub fn issue_credential(
+    /// Gửi XLM trực tiếp cho người khác kèm ghi chú
+    /// amount tính bằng stroops (1 XLM = 10_000_000)
+    pub fn send_payment(
         env: Env,
-        student: Address,
-        course_name: String,
-        credential_type: CredentialType,
-        reward_points: u32,
+        sender: Address,
+        receiver: Address,
+        amount: i128,
+        note: String,
     ) -> u64 {
-        // Chỉ admin được gọi
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
+        // Yêu cầu chữ ký của người gửi
+        sender.require_auth();
 
-        // Tạo ID mới
-        let count: u64 = env.storage().instance()
-            .get(&DataKey::CredentialCount)
-            .unwrap_or(0);
-        let new_id = count + 1;
+        if amount <= 0 {
+            panic!("Amount must be greater than 0");
+        }
+        if sender == receiver {
+            panic!("Cannot send to yourself");
+        }
 
-        // Tạo credential
-        let credential = Credential {
+        // Tạo transaction record on-chain
+        let tx_count: u64 = env.storage().instance()
+            .get(&DataKey::TxCount).unwrap_or(0);
+        let new_id = tx_count + 1;
+
+        let tx = Transaction {
             id: new_id,
-            student: student.clone(),
-            course_name: course_name.clone(),
-            credential_type,
-            status: CredentialStatus::Active,
-            issued_at: env.ledger().sequence() as u64,
-            points: reward_points,
+            sender: sender.clone(),
+            receiver: receiver.clone(),
+            amount,
+            note: note.clone(),
+            timestamp: env.ledger().sequence() as u64,
         };
 
-        // Lưu credential
-        env.storage().instance().set(&DataKey::Credential(new_id), &credential);
-        env.storage().instance().set(&DataKey::CredentialCount, &new_id);
+        env.storage().instance().set(&DataKey::Transaction(new_id), &tx);
+        env.storage().instance().set(&DataKey::TxCount, &new_id);
 
-        // Cộng điểm thưởng cho sinh viên
-        let current_points: u32 = env.storage().instance()
-            .get(&DataKey::StudentPoints(student.clone()))
-            .unwrap_or(0);
+        // Cập nhật thống kê user
+        let user_count: u64 = env.storage().instance()
+            .get(&DataKey::UserTxCount(sender.clone())).unwrap_or(0);
         env.storage().instance().set(
-            &DataKey::StudentPoints(student.clone()),
-            &(current_points + reward_points),
+            &DataKey::UserTxCount(sender.clone()),
+            &(user_count + 1),
         );
-
-        // Cập nhật số credential của sinh viên
-        let cred_count: u32 = env.storage().instance()
-            .get(&DataKey::StudentCredCount(student.clone()))
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::StudentCredCount(student.clone()),
-            &(cred_count + 1),
-        );
+        env.storage().instance().set(&DataKey::UserLastTx(sender.clone()), &new_id);
 
         // Emit event
         env.events().publish(
-            (symbol_short!("issued"), student.clone()),
-            (new_id, reward_points),
+            (symbol_short!("sent"), sender.clone()),
+            (receiver.clone(), amount, new_id),
         );
 
-        log!(&env, "Credential #{} issued to student. Points awarded: {}", new_id, reward_points);
+        log!(&env, "Payment #{}: {} stroops sent. Note: {}", new_id, amount, note);
 
         new_id
     }
 
     // ----------------------------------------------------------
-    // VERIFY — xác minh credential
+    // REQUEST PAYMENT — yêu cầu thanh toán
     // ----------------------------------------------------------
 
-    /// Xác minh credential có hợp lệ không
-    /// Trả về true nếu Active, false nếu Revoked hoặc không tồn tại
-    pub fn verify_credential(env: Env, credential_id: u64) -> bool {
-        let key = DataKey::Credential(credential_id);
+    /// Tạo yêu cầu thanh toán gửi đến một người
+    /// Ví dụ: merchant yêu cầu khách hàng trả tiền
+    pub fn request_payment(
+        env: Env,
+        from: Address,    // người yêu cầu
+        to: Address,      // người cần trả
+        amount: i128,
+        note: String,
+    ) -> u64 {
+        from.require_auth();
 
-        if !env.storage().instance().has(&key) {
-            return false;
+        if amount <= 0 {
+            panic!("Amount must be greater than 0");
+        }
+        if from == to {
+            panic!("Cannot request from yourself");
         }
 
-        let credential: Credential = env.storage().instance().get(&key).unwrap();
-        credential.status == CredentialStatus::Active
+        let req_count: u64 = env.storage().instance()
+            .get(&DataKey::RequestCount).unwrap_or(0);
+        let new_id = req_count + 1;
+
+        let request = PaymentRequest {
+            id: new_id,
+            from: from.clone(),
+            to: to.clone(),
+            amount,
+            note: note.clone(),
+            status: RequestStatus::Pending,
+            created_at: env.ledger().sequence() as u64,
+        };
+
+        env.storage().instance().set(&DataKey::Request(new_id), &request);
+        env.storage().instance().set(&DataKey::RequestCount, &new_id);
+
+        // Emit event để notify người nhận request
+        env.events().publish(
+            (symbol_short!("req"), to.clone()),
+            (from.clone(), amount, new_id),
+        );
+
+        log!(&env, "Payment request #{} created: {} stroops. Note: {}", new_id, amount, note);
+
+        new_id
     }
 
-    /// Lấy toàn bộ thông tin của một credential
-    pub fn get_credential(env: Env, credential_id: u64) -> Credential {
-        let key = DataKey::Credential(credential_id);
+    /// Thanh toán một request đang Pending
+    pub fn pay_request(env: Env, payer: Address, request_id: u64) {
+        payer.require_auth();
+
+        let key = DataKey::Request(request_id);
         if !env.storage().instance().has(&key) {
-            panic!("Credential not found");
+            panic!("Request not found");
+        }
+
+        let mut request: PaymentRequest = env.storage().instance().get(&key).unwrap();
+
+        if request.to != payer {
+            panic!("You are not the payer of this request");
+        }
+        if request.status != RequestStatus::Pending {
+            panic!("Request is not pending");
+        }
+
+        // Cập nhật trạng thái request
+        request.status = RequestStatus::Paid;
+        env.storage().instance().set(&key, &request);
+
+        // Ghi lại giao dịch vào lịch sử
+        let tx_count: u64 = env.storage().instance()
+            .get(&DataKey::TxCount).unwrap_or(0);
+        let new_tx_id = tx_count + 1;
+
+        let tx = Transaction {
+            id: new_tx_id,
+            sender: payer.clone(),
+            receiver: request.from.clone(),
+            amount: request.amount,
+            note: request.note.clone(),
+            timestamp: env.ledger().sequence() as u64,
+        };
+
+        env.storage().instance().set(&DataKey::Transaction(new_tx_id), &tx);
+        env.storage().instance().set(&DataKey::TxCount, &new_tx_id);
+
+        env.events().publish(
+            (symbol_short!("paid"), payer.clone()),
+            (request_id, new_tx_id),
+        );
+
+        log!(&env, "Request #{} paid. Tx #{}", request_id, new_tx_id);
+    }
+
+    /// Huỷ request — chỉ người tạo request mới huỷ được
+    pub fn cancel_request(env: Env, caller: Address, request_id: u64) {
+        caller.require_auth();
+
+        let key = DataKey::Request(request_id);
+        if !env.storage().instance().has(&key) {
+            panic!("Request not found");
+        }
+
+        let mut request: PaymentRequest = env.storage().instance().get(&key).unwrap();
+
+        if request.from != caller {
+            panic!("Only the requester can cancel");
+        }
+        if request.status != RequestStatus::Pending {
+            panic!("Request is not pending");
+        }
+
+        request.status = RequestStatus::Cancelled;
+        env.storage().instance().set(&key, &request);
+
+        log!(&env, "Request #{} cancelled", request_id);
+    }
+
+    // ----------------------------------------------------------
+    // SPLIT BILL — chia bill nhóm
+    // ----------------------------------------------------------
+
+    /// Tạo bill chia đều cho một nhóm người
+    /// Ví dụ: 4 người ăn tối, tổng 400k → mỗi người 100k
+    pub fn create_split(
+        env: Env,
+        creator: Address,
+        participants: Vec<Address>,
+        total_amount: i128,
+        note: String,
+    ) -> u64 {
+        creator.require_auth();
+
+        let participant_count = participants.len();
+        if participant_count < 2 {
+            panic!("Need at least 2 participants");
+        }
+        if total_amount <= 0 {
+            panic!("Total amount must be greater than 0");
+        }
+
+        let amount_per_person = total_amount / participant_count as i128;
+
+        let split_count: u64 = env.storage().instance()
+            .get(&DataKey::SplitCount).unwrap_or(0);
+        let new_id = split_count + 1;
+
+        let split = SplitBill {
+            id: new_id,
+            creator: creator.clone(),
+            total_amount,
+            note: note.clone(),
+            participants: participants.clone(),
+            amount_per_person,
+            paid_count: 0,
+            created_at: env.ledger().sequence() as u64,
+        };
+
+        env.storage().instance().set(&DataKey::Split(new_id), &split);
+        env.storage().instance().set(&DataKey::SplitCount, &new_id);
+
+        env.events().publish(
+            (symbol_short!("split"), creator.clone()),
+            (new_id, total_amount, participant_count),
+        );
+
+        log!(
+            &env,
+            "Split bill #{}: {} stroops / {} people = {} each. Note: {}",
+            new_id, total_amount, participant_count, amount_per_person, note
+        );
+
+        new_id
+    }
+
+    /// Một người trong nhóm xác nhận đã trả phần của mình
+    pub fn pay_split(env: Env, payer: Address, split_id: u64) {
+        payer.require_auth();
+
+        let key = DataKey::Split(split_id);
+        if !env.storage().instance().has(&key) {
+            panic!("Split bill not found");
+        }
+
+        let mut split: SplitBill = env.storage().instance().get(&key).unwrap();
+
+        // Kiểm tra payer có trong danh sách không
+        let mut is_participant = false;
+        for p in split.participants.iter() {
+            if p == payer {
+                is_participant = true;
+                break;
+            }
+        }
+        if !is_participant {
+            panic!("You are not a participant of this split");
+        }
+
+        // Kiểm tra đã trả chưa
+        let paid_key = DataKey::SplitPaid(split_id, payer.clone());
+        if env.storage().instance().has(&paid_key) {
+            panic!("You already paid this split");
+        }
+
+        // Đánh dấu đã trả
+        env.storage().instance().set(&paid_key, &true);
+        split.paid_count += 1;
+        env.storage().instance().set(&key, &split);
+
+        env.events().publish(
+            (symbol_short!("spaid"), payer.clone()),
+            (split_id, split.amount_per_person),
+        );
+
+        log!(
+            &env,
+            "Split #{}: {} paid {} stroops. {}/{} paid",
+            split_id, payer, split.amount_per_person,
+            split.paid_count, split.participants.len()
+        );
+    }
+
+    // ----------------------------------------------------------
+    // READ — đọc dữ liệu / lịch sử
+    // ----------------------------------------------------------
+
+    /// Lấy thông tin một giao dịch theo ID
+    pub fn get_transaction(env: Env, tx_id: u64) -> Transaction {
+        let key = DataKey::Transaction(tx_id);
+        if !env.storage().instance().has(&key) {
+            panic!("Transaction not found");
         }
         env.storage().instance().get(&key).unwrap()
     }
 
-    // ----------------------------------------------------------
-    // REVOKE — thu hồi credential
-    // ----------------------------------------------------------
-
-    /// Admin thu hồi credential (ví dụ: sinh viên gian lận)
-    pub fn revoke_credential(env: Env, credential_id: u64) {
-        // Chỉ admin được gọi
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let key = DataKey::Credential(credential_id);
+    /// Lấy thông tin một payment request
+    pub fn get_request(env: Env, request_id: u64) -> PaymentRequest {
+        let key = DataKey::Request(request_id);
         if !env.storage().instance().has(&key) {
-            panic!("Credential not found");
+            panic!("Request not found");
         }
-
-        let mut credential: Credential = env.storage().instance().get(&key).unwrap();
-
-        if credential.status == CredentialStatus::Revoked {
-            panic!("Credential already revoked");
-        }
-
-        // Thu hồi điểm thưởng đã cộng
-        let current_points: u32 = env.storage().instance()
-            .get(&DataKey::StudentPoints(credential.student.clone()))
-            .unwrap_or(0);
-        let new_points = current_points.saturating_sub(credential.points);
-        env.storage().instance().set(
-            &DataKey::StudentPoints(credential.student.clone()),
-            &new_points,
-        );
-
-        // Cập nhật trạng thái
-        credential.status = CredentialStatus::Revoked;
-        env.storage().instance().set(&key, &credential);
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("revoked"), credential.student.clone()),
-            credential_id,
-        );
-
-        log!(&env, "Credential #{} has been revoked", credential_id);
+        env.storage().instance().get(&key).unwrap()
     }
 
-    // ----------------------------------------------------------
-    // REWARDS — xem điểm thưởng
-    // ----------------------------------------------------------
+    /// Lấy thông tin một split bill
+    pub fn get_split(env: Env, split_id: u64) -> SplitBill {
+        let key = DataKey::Split(split_id);
+        if !env.storage().instance().has(&key) {
+            panic!("Split not found");
+        }
+        env.storage().instance().get(&key).unwrap()
+    }
 
-    /// Lấy tổng điểm thưởng của một sinh viên
-    pub fn get_points(env: Env, student: Address) -> u32 {
+    /// Kiểm tra một người đã trả split bill chưa
+    pub fn is_split_paid(env: Env, split_id: u64, participant: Address) -> bool {
         env.storage().instance()
-            .get(&DataKey::StudentPoints(student))
+            .has(&DataKey::SplitPaid(split_id, participant))
+    }
+
+    /// Tổng số giao dịch của một user
+    pub fn get_user_tx_count(env: Env, user: Address) -> u64 {
+        env.storage().instance()
+            .get(&DataKey::UserTxCount(user))
             .unwrap_or(0)
     }
 
-    /// Lấy số lượng credential của một sinh viên
-    pub fn get_credential_count(env: Env, student: Address) -> u32 {
+    /// Tổng số giao dịch toàn hệ thống
+    pub fn total_transactions(env: Env) -> u64 {
         env.storage().instance()
-            .get(&DataKey::StudentCredCount(student))
+            .get(&DataKey::TxCount)
             .unwrap_or(0)
     }
 
-    // ----------------------------------------------------------
-    // ADMIN UTILS
-    // ----------------------------------------------------------
-
-    /// Lấy địa chỉ admin hiện tại
-    pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
+    /// Tổng số split bill đã tạo
+    pub fn total_splits(env: Env) -> u64 {
+        env.storage().instance()
+            .get(&DataKey::SplitCount)
+            .unwrap_or(0)
     }
 
-    /// Tổng số credential đã cấp
-    pub fn total_credentials(env: Env) -> u64 {
+    /// Tổng số payment request đã tạo
+    pub fn total_requests(env: Env) -> u64 {
         env.storage().instance()
-            .get(&DataKey::CredentialCount)
+            .get(&DataKey::RequestCount)
             .unwrap_or(0)
     }
 }
@@ -257,59 +447,147 @@ impl StudentCredentialContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation};
-    use soroban_sdk::{vec, Address, Env, IntoVal};
+    use soroban_sdk::{vec, Address, Env, String};
 
     #[test]
-    fn test_full_flow() {
+    fn test_send_payment() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let contract_id = env.register_contract(None, StudentCredentialContract);
-        let client = StudentCredentialContractClient::new(&env, &contract_id);
+        let contract_id = env.register_contract(None, LocalPaymentContract);
+        let client = LocalPaymentContractClient::new(&env, &contract_id);
 
-        let admin = Address::generate(&env);
-        let student = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let note = String::from_str(&env, "Tien com trua");
 
-        // 1. Initialize
-        client.initialize(&admin);
-        assert_eq!(client.get_admin(), admin);
+        // Gửi 10 XLM = 100_000_000 stroops
+        let tx_id = client.send_payment(&sender, &receiver, &100_000_000i128, &note);
+        assert_eq!(tx_id, 1);
 
-        // 2. Issue credential
-        let course = String::from_str(&env, "Soroban Smart Contract Bootcamp");
-        let cred_id = client.issue_credential(
-            &student,
-            &course,
-            &CredentialType::Certificate,
-            &100u32,
-        );
-        assert_eq!(cred_id, 1);
+        let tx = client.get_transaction(&1u64);
+        assert_eq!(tx.amount, 100_000_000i128);
+        assert_eq!(tx.sender, sender);
+        assert_eq!(tx.receiver, receiver);
+        assert_eq!(client.total_transactions(), 1u64);
+        assert_eq!(client.get_user_tx_count(&sender), 1u64);
 
-        // 3. Verify credential
-        assert_eq!(client.verify_credential(&1u64), true);
-
-        // 4. Check points
-        assert_eq!(client.get_points(&student), 100u32);
-
-        // 5. Revoke credential
-        client.revoke_credential(&1u64);
-        assert_eq!(client.verify_credential(&1u64), false);
-
-        // 6. Points bị trừ sau khi revoke
-        assert_eq!(client.get_points(&student), 0u32);
-
-        println!("All tests passed!");
+        println!("test_send_payment passed!");
     }
 
     #[test]
-    #[should_panic(expected = "Already initialized")]
-    fn test_double_initialize() {
+    fn test_request_and_pay() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, StudentCredentialContract);
-        let client = StudentCredentialContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        client.initialize(&admin);
-        client.initialize(&admin); // phải panic
+
+        let contract_id = env.register_contract(None, LocalPaymentContract);
+        let client = LocalPaymentContractClient::new(&env, &contract_id);
+
+        let merchant = Address::generate(&env);
+        let customer = Address::generate(&env);
+        let note = String::from_str(&env, "Tien cafe");
+
+        // Merchant tạo request 5 XLM
+        let req_id = client.request_payment(
+            &merchant, &customer, &50_000_000i128, &note,
+        );
+        assert_eq!(req_id, 1);
+
+        let req = client.get_request(&1u64);
+        assert_eq!(req.status, RequestStatus::Pending);
+
+        // Customer thanh toán
+        client.pay_request(&customer, &1u64);
+        let req_after = client.get_request(&1u64);
+        assert_eq!(req_after.status, RequestStatus::Paid);
+
+        println!("test_request_and_pay passed!");
+    }
+
+    #[test]
+    fn test_cancel_request() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, LocalPaymentContract);
+        let client = LocalPaymentContractClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let note = String::from_str(&env, "test");
+
+        client.request_payment(&alice, &bob, &100_000_000i128, &note);
+        client.cancel_request(&alice, &1u64);
+
+        let req = client.get_request(&1u64);
+        assert_eq!(req.status, RequestStatus::Cancelled);
+
+        println!("test_cancel_request passed!");
+    }
+
+    #[test]
+    fn test_split_bill() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, LocalPaymentContract);
+        let client = LocalPaymentContractClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let charlie = Address::generate(&env);
+
+        let participants = vec![&env, alice.clone(), bob.clone(), charlie.clone()];
+        let note = String::from_str(&env, "An toi sinh nhat");
+
+        // 300 XLM cho 3 người → mỗi người 100 XLM
+        let split_id = client.create_split(
+            &alice, &participants, &3_000_000_000i128, &note,
+        );
+        assert_eq!(split_id, 1);
+
+        let split = client.get_split(&1u64);
+        assert_eq!(split.amount_per_person, 1_000_000_000i128);
+        assert_eq!(split.paid_count, 0u32);
+
+        // Bob trả phần của mình
+        client.pay_split(&bob, &1u64);
+        assert_eq!(client.is_split_paid(&1u64, &bob), true);
+        assert_eq!(client.is_split_paid(&1u64, &alice), false);
+
+        let split_after = client.get_split(&1u64);
+        assert_eq!(split_after.paid_count, 1u32);
+
+        println!("test_split_bill passed!");
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot send to yourself")]
+    fn test_cannot_send_to_self() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, LocalPaymentContract);
+        let client = LocalPaymentContractClient::new(&env, &contract_id);
+        let user = Address::generate(&env);
+        let note = String::from_str(&env, "test");
+        client.send_payment(&user, &user, &100i128, &note);
+    }
+
+    #[test]
+    #[should_panic(expected = "You already paid this split")]
+    fn test_double_pay_split() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, LocalPaymentContract);
+        let client = LocalPaymentContractClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let participants = vec![&env, alice.clone(), bob.clone()];
+        let note = String::from_str(&env, "test");
+
+        client.create_split(&alice, &participants, &200_000_000i128, &note);
+        client.pay_split(&bob, &1u64);
+        client.pay_split(&bob, &1u64); // phải panic
     }
 }
