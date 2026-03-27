@@ -61,8 +61,8 @@ CCX7SBW2EKTB6ZBUCKUOM2EEEPOGAFSH37UCO7WJC22WIYGZHEZ53NVB
 [https://stellar.expert/explorer/testnet/contract/CCX7SBW2EKTB6ZBUCKUOM2EEEPOGAFSH37UCO7WJC22WIYGZHEZ53NVB](https://stellar.expert/explorer/testnet/contract/CCX7SBW2EKTB6ZBUCKUOM2EEEPOGAFSH37UCO7WJC22WIYGZHEZ53NVB)
 
 ### 📸 Contract Screenshot
-<img width="1058" height="696" alt="image" src="https://github.com/user-attachments/assets/4bc5eb0f-7589-4786-b367-cbf076871e65" />
-<img width="1048" height="819" alt="image" src="https://github.com/user-attachments/assets/f3b8ea03-f437-45c8-a783-bf36cf9442e3" />
+<img width="1919" height="1076" alt="image" src="https://github.com/user-attachments/assets/18aecdff-7e4f-4225-aa34-14bb61850457" />
+
 
 
 ---
